@@ -26,7 +26,7 @@ export interface UserSession {
     db?: Database; // Handle can be file-based or in-memory
     databaseFilename?: string; // Only set if persistence is enabled
     createdAt: number;
-    transportSessionId?: string;
+    // transportSessionId?: string;
 }
 
 export interface ActiveTransportEntry {
@@ -38,8 +38,11 @@ export interface ActiveTransportEntry {
 // Stores active user sessions, keyed by MCP Access Token
 export const activeSessions = new Map<string, UserSession>();
 
-// Stores active SSE transport connections, keyed by their unique transport ID
+// Stores active SSE transport connections, keyed by MCP Access Token
 export const activeSseTransports = new Map<string, ActiveTransportEntry>();
+
+// Maps a transport's internal session ID to the MCP Access Token
+export const transportIdToMcpAccessToken = new Map<string, string>();
 
 // --- Centralized DB Handling ---
 

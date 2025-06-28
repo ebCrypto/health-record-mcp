@@ -6,13 +6,14 @@
   "type": "module",
   "scripts": {
     "start": "bun run src/sse.ts",
+    "start:http": "bun run src/http.ts",
     "build:ehretriever": "bun run ./scripts/build-ehretriever.ts",
     "build:ehr-tool": "bun build src/tools-browser-entry.ts --outfile intrabrowser/public/ehr-mcp/dist/tools.js --target browser --format esm --external bun:sqlite --external vm --external fs/promises --external child_process"
   },
   "dependencies": {
     "@google/genai": "^0.8.0",
     "@google/generative-ai": "^0.24.0",
-    "@modelcontextprotocol/sdk": "^1.0.1",
+    "@modelcontextprotocol/sdk": "^1.13.1",
     "@radix-ui/react-icons": "^1.3.2",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.1",

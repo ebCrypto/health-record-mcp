@@ -22,7 +22,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { ClientFullEHR } from '../clientTypes.js'; // Import ClientFullEHR
 import { AppConfig, loadConfig } from './config.ts';
 import { addOauthRoutesAndProvider } from './oauth.ts';
-import { UserSession, createOrOpenDbForSession, activeSessions, activeSseTransports } from './sessionUtils.js'; // Import the new DB function and state
+import { UserSession, createOrOpenDbForSession, activeSessions, activeSseTransports, transportIdToMcpAccessToken } from './sessionUtils.js'; // Import the new DB function and state
 import {
     registerEhrTools // Import the new function
 } from './tools.js';
@@ -31,6 +31,7 @@ import { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { ehrToSqlite, sqliteToEhr } from './dbUtils.js'; // Import functions from dbUtils
 import type { AuthzRequestState } from './oauth';
 import { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
+import { addStreamableHttpTransport } from './streamable-http.ts';
 
 // --- Add Type Declaration for req.auth ---
 declare module "express-serve-static-core" {
@@ -60,18 +61,24 @@ async function getSseContext(
     if (!transportSessionId) {
         throw new McpError(ErrorCode.InvalidRequest, "Missing session identifier.");
     }
-    const transportEntry = activeSseTransports.get(transportSessionId);
+
+    const mcpAccessToken = transportIdToMcpAccessToken.get(transportSessionId);
+    if (!mcpAccessToken) {
+        console.error(`[SSE Context] Inconsistency: Transport ${transportSessionId} has no corresponding MCP Access Token.`);
+        throw new McpError(ErrorCode.InternalError, "Session data not found for active connection (no token mapping).");
+    }
+
+    const transportEntry = activeSseTransports.get(mcpAccessToken);
     if (!transportEntry) {
+        // This case should be rare if the transportIdToMcpAccessToken map is synced correctly
         throw new McpError(ErrorCode.InvalidRequest, "Invalid or disconnected session.");
     }
-    // Correct way to iterate/search a Map's values
-    const session: UserSession | undefined = Array.from(activeSessions.values()).find(session => session.transportSessionId === transportSessionId);
+
+    const session: UserSession | undefined = activeSessions.get(mcpAccessToken);
     
-    const mcpAccessToken = session?.sessionId; // Still useful for logging
     if (!session) {
         // This indicates an inconsistency if transportEntry exists but session doesn't
-        // Use mcpAccessToken cautiously here as it might be undefined
-        console.error(`[SSE Context] Inconsistency: Transport ${transportSessionId} exists but no corresponding session found in activeSessions.`);
+        console.error(`[SSE Context] Inconsistency: Transport and token mapping exist for ${mcpAccessToken.substring(0,8)} but no session found in activeSessions.`);
         throw new McpError(ErrorCode.InternalError, "Session data not found for active connection.");
     }
 
@@ -165,10 +172,29 @@ async function main() {
         const oauthProvider = addOauthRoutesAndProvider(app, config, activeSessions);
         console.log("[INIT] OAuth routes and provider initialized.");
         
-        // --- Custom Bearer Auth Middleware using the returned provider ---
-        const bearerAuthMiddleware = requireBearerAuth({ provider: oauthProvider  } );
-        console.log("[INIT] Bearer auth middleware initialized.");
-        console.log(oauthProvider);
+        addStreamableHttpTransport(app, mcpServer, oauthProvider);
+        console.log("[INIT] Streamable HTTP transport initialized.");
+
+        // --- Custom Bearer Auth Middleware for SSE ---
+        const sseBearerAuthMiddleware = async (req: Request, res: Response, next: express.NextFunction) => {
+            try {
+                const authHeader = req.headers.authorization;
+                if (!authHeader || !authHeader.toLowerCase().startsWith('bearer ')) {
+                    res.status(401).header('WWW-Authenticate', 'Bearer').json({ error: 'unauthorized', error_description: 'Missing bearer token.' });
+                    return;
+                }
+                
+                const token = authHeader.substring(7);
+                const authInfo = await oauthProvider.verifyAccessToken(token);
+                req.auth = authInfo;
+                next();
+            } catch (error: any) {
+                console.warn(`[SSE Auth] Token verification failed: ${error.message}`);
+                res.status(401).header('WWW-Authenticate', 'Bearer error="invalid_token"').json({ error: 'invalid_token', error_description: 'The access token is invalid or has expired.' });
+            }
+        };
+        console.log("[INIT] SSE Bearer auth middleware initialized.");
+        
 
         // --- API Endpoints (Not OAuth related) ---
 
@@ -260,7 +286,7 @@ async function main() {
         });
 
         // --- MCP SSE Endpoint ---
-        app.get("/mcp-sse", bearerAuthMiddleware, async (req: Request, res: Response) => {
+        app.get("/mcp-sse", sseBearerAuthMiddleware, async (req: Request, res: Response) => {
             const authInfo = req.auth; // Provided by bearerAuthMiddleware
             if (!authInfo) {
                 // This *shouldn't* happen if middleware is correct, but safeguard anyway
@@ -303,28 +329,31 @@ async function main() {
                 const transportSessionId = transport.sessionId; // Get the unique ID generated by the transport
         
                 // Link the transport session ID back to the UserSession
-                session.transportSessionId = transportSessionId;
+                // session.transportSessionId = transportSessionId;
         
                 // Store the active transport, linking it to the MCP token and auth info
-                activeSseTransports.set(transportSessionId, { 
+                activeSseTransports.set(mcpAccessToken, { 
                     transport: transport,
                 });
+                // Create the reverse mapping
+                transportIdToMcpAccessToken.set(transportSessionId, mcpAccessToken);
+
                 console.log(`[SSE GET] Client connected & authenticated. Transport Session ID: ${transportSessionId}, linked to MCP Token: ${mcpAccessToken.substring(0, 8)}...`);
         
                 await mcpServer.connect(transport);
                  console.log(`[SSE GET] MCP Server connected to transport ${transportSessionId}. Waiting for messages...`);
-        
             } catch (error) {
                 console.error("[SSE GET] Error setting up authenticated SSE connection:", error);
                 // --- Cleanup on Error ---
                 if (transport) {
                      const transportSessionId = transport.sessionId; // Get ID even if setup failed mid-way
                      console.log(`[SSE Error Cleanup] Removing transport entry for ${transportSessionId}`);
-                    activeSseTransports.delete(transportSessionId);
+                    activeSseTransports.delete(mcpAccessToken);
+                    transportIdToMcpAccessToken.delete(transportSessionId);
                     // If the session was partially updated, reset its transport ID
-                    if (session && session.transportSessionId === transportSessionId) {
-                         session.transportSessionId = ""; 
-                     }
+                    // if (session && session.transportSessionId === transportSessionId) {
+                    //      session.transportSessionId = ""; 
+                    //  }
                      // Ensure transport is closed if possible
                      try { transport.close(); } catch(e) {}
                 }
@@ -344,7 +373,7 @@ async function main() {
         });
         
         // --- MCP Message POST Endpoint ---
-        app.post("/mcp-messages", bearerAuthMiddleware, (req: Request, res: Response) => { 
+        app.post("/mcp-messages", sseBearerAuthMiddleware, (req: Request, res: Response) => { 
             const authInfo = req.auth; // Provided by bearerAuthMiddleware
             if (!authInfo) {
                 console.error("[MCP POST] Middleware succeeded but req.auth is missing!");
@@ -354,28 +383,22 @@ async function main() {
 
             const session = activeSessions.get(authInfo.token);
             if (!session) {
-                console.warn("[MCP POST] Received POST for unknown/expired sessionId: ${req.query.sessionId}");
-                res.status(404).send("Invalid or expired sessionId"); 
-                return;
-            }
-            if (!session.transportSessionId) {
-                console.warn("[MCP POST] Received POST for session with no transport sessionId.");
-                res.status(404).send("Invalid or expired sessionId"); 
+                // This case should be rare since bearerAuthMiddleware just validated the token
+                console.warn(`[MCP POST] Inconsistency: Auth succeeded but session not found for token ${authInfo.token.substring(0,8)}...`);
+                res.status(404).send("Invalid or expired session");
                 return;
             }
             
-            // Find the active transport entry
-            const transportEntry = activeSseTransports.get(session.transportSessionId); // Use transport session ID
+            const transportEntry = activeSseTransports.get(authInfo.token);
             if (!transportEntry) {
-                console.warn(`[MCP POST] Received POST for unknown/expired transport sessionId: ${session.transportSessionId}`);
-                // 404 or 410 Gone might be appropriate if the session *was* active but disconnected
-                res.status(404).send("Invalid or expired sessionId"); 
+                console.warn(`[MCP POST] Received POST for active session without a transport: ${authInfo.token.substring(0,8)}... Has the SSE connection been established?`);
+                res.status(404).send("SSE transport not established for this session");
                 return;
             }
         
             const transport = transportEntry.transport;
             try {
-                console.log(`[MCP POST] Received POST for transport session ${session.transportSessionId}, linked to MCP Token: ${session.sessionId.substring(0,8)}...`);
+                console.log(`[MCP POST] Received POST for session with MCP Token: ${authInfo.token.substring(0,8)}...`);
                 // Log headers or body if needed for debugging (careful with sensitive data)
                 // console.log("[MCP POST] Headers:", req.headers);
                 // console.log("[MCP POST] Body (partial):", JSON.stringify(req.body).substring(0, 200)); 
@@ -383,11 +406,11 @@ async function main() {
                 // Pass the request and response to the transport's handler
                 // The SDK's handlePostMessage will parse the MCP message, find the handler, execute it, and send the response.
                 transport.handlePostMessage(req, res);
-                console.log(`[MCP POST] Handled POST for session ${session.transportSessionId}`);
+                console.log(`[MCP POST] Handled POST for session ${authInfo.token.substring(0,8)}...`);
         
             } catch (error) {
                 // Catch errors specifically from handlePostMessage (e.g., invalid message format, handler execution error)
-                console.error(`[MCP POST] Error in handlePostMessage for session ${session.transportSessionId}:`, error);
+                console.error(`[MCP POST] Error in handlePostMessage for session ${authInfo.token.substring(0,8)}...:`, error);
                 if (!res.headersSent) {
                     // Send a generic 500 error if the handler failed internally
                     res.status(500).send("Error processing message");
@@ -497,6 +520,7 @@ async function main() {
                      // pickerSessions.clear();
                      // registeredMcpClients.clear(); // Clear registered clients if dynamic
                      activeSseTransports.clear(); // Should be cleared by mcpServer.close, but clear again to be sure
+                     transportIdToMcpAccessToken.clear();
                      console.log("[Shutdown] Temporary state maps cleared (Note: OAuth internal state persists until exit).");
         
                      console.log("[Shutdown] Shutdown complete.");

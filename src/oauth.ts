@@ -18,7 +18,7 @@ import {
     OAuthTokenRevocationRequest,
     OAuthTokens
 } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+// import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 
 // --- Local Imports ---
 import { AppConfig } from './config.js'; // Import AppConfig
@@ -152,7 +152,7 @@ class MyOAuthClientStore /* implements OAuthClientStore */ {
     }
 }
 
-class MyOAuthServerProvider implements OAuthServerProvider {
+export class MyOAuthServerProvider implements OAuthServerProvider {
     private clientStore = new MyOAuthClientStore();
     private activeSessions: Map<string, UserSession>;
 
@@ -336,7 +336,7 @@ export function addOauthRoutesAndProvider(
     app: Application,
     config: AppConfig, // Accept AppConfig
     activeSessions: Map<string, UserSession>,
-): OAuthServerProvider {
+): MyOAuthServerProvider {
 
     const oauthProvider = new MyOAuthServerProvider(activeSessions);
 
@@ -347,14 +347,44 @@ export function addOauthRoutesAndProvider(
     }
     setInterval(cleanupExpiredState, 60 * 1000);
 
+    const baseUrl = function(req){
+        const protocol = req.get('X-Forwarded-Proto') || req.protocol;
+        const host = req.get('X-Forwarded-Host') || req.hostname;
+
+        // req.originalUrl contains the path and query string (e.g., "/users/123?format=json")
+        const fullUrl = `${protocol}://${host}${req.originalUrl}`;
+
+        console.log('--- Request Details ---');
+        console.log('Original Protocol:', protocol);
+        console.log('Original Host:', host);
+        console.log('Path + Query:', req.originalUrl);
+        console.log('Full Original URL:', fullUrl);
+        const base = `${protocol}://${host}`;
+        console.log("base", base);
+        return base;
+    }
+
+    app.get('/.well-known/oauth-protected-resource', (req, res) => {
+        console.log("[.well-known protected resource] Request received.", req.originalUrl);
+        const base = baseUrl(req);
+        res.json({
+            resource: base,
+            authorization_servers: [base],
+            bearer_methods_supported: ["header"],
+            scopes_supported: ["openid", "fhirUser", "launch/patient", "patient/*.read", "offline_access"],
+        });
+    });
+
+
     app.get('/.well-known/oauth-authorization-server', (req, res) => {
         console.log("[.well-known] Request received.");
+        const base = baseUrl(req);
         res.json({
-            issuer: config.server.baseUrl,
-            registration_endpoint: `${config.server.baseUrl}/register`,
-            authorization_endpoint: `${config.server.baseUrl}/authorize`,
-            token_endpoint: `${config.server.baseUrl}/token`,
-            revocation_endpoint: `${config.server.baseUrl}/revoke`,
+            issuer: base,
+            registration_endpoint: `${base}/register`,
+            authorization_endpoint: `${base}/authorize`,
+            token_endpoint: `${base}/token`,
+            revocation_endpoint: `${base}/revoke`,
             scopes_supported: ["openid", "fhirUser", "launch/patient", "patient/*.read", "offline_access"],
             response_types_supported: ["code"],
             grant_types_supported: [AuthGrantType.AuthorizationCode],
